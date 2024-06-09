@@ -88,9 +88,59 @@ static int lps22hb_channel_get(const struct device *dev,
 	return 0;
 }
 
+static const uint16_t lps22hb_map[] = {0, 1, 10, 25, 50, 75, 100, 200};
+
+static int lps22hb_odr_set(const struct device *dev, uint16_t freq)
+{
+	int odr;
+
+	for (odr = 0; odr < ARRAY_SIZE(lps22hb_map); odr++) {
+		if (freq == lps22hb_map[odr]) {
+			break;
+		}
+	}
+
+	if (odr == ARRAY_SIZE(lps22hb_map)) {
+		LOG_DBG("bad frequency");
+		return -EINVAL;
+	}
+
+	if (lps22hb_set_odr_raw(dev, odr) < 0) {
+		LOG_DBG("failed to set sampling rate");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int lps22hb_attr_set(const struct device *dev,
+			    enum sensor_channel chan,
+			    enum sensor_attribute attr,
+			    const struct sensor_value *val)
+{
+	if (chan != SENSOR_CHAN_ALL) {
+		LOG_WRN("attr_set() not supported on this channel.");
+		return -ENOTSUP;
+	}
+
+	switch (attr) {
+	case SENSOR_ATTR_SAMPLING_FREQUENCY:
+		return lps22hb_odr_set(dev, val->val1);
+	default:
+		LOG_DBG("operation not supported.");
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
 static const struct sensor_driver_api lps22hb_api_funcs = {
+	.attr_set = lps22hb_attr_set,
 	.sample_fetch = lps22hb_sample_fetch,
 	.channel_get = lps22hb_channel_get,
+#if CONFIG_LPS22HB_TRIGGER
+	.trigger_set = lps22hb_trigger_set,
+#endif
 };
 
 static int lps22hb_init_chip(const struct device *dev)
@@ -141,6 +191,12 @@ static int lps22hb_init(const struct device *dev)
 		return -EIO;
 	}
 
+#ifdef CONFIG_LPS22HB_TRIGGER
+	if (lps22hb_init_interrupt(dev) < 0) {
+		LOG_ERR("Failed to initialize interrupt.");
+		return -EIO;
+	}
+#endif
 	return 0;
 }
 
