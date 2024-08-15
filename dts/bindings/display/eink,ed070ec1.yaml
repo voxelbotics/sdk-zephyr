@@ -95,3 +95,4 @@ child-binding:
     gate-line-width:
       type: int
       description: Gate line width override.
+
