@@ -18,6 +18,8 @@ LOG_MODULE_REGISTER(ed070ec1);
 #include <zephyr/drivers/spi.h>
 #include <zephyr/sys/byteorder.h>
 
+#include <nrfx_spim.h>
+
 #include <zephyr/display/ed070ec1.h>
 #include "ed070ec1_regs.h"
 
@@ -38,6 +40,22 @@ enum ed070ec1_profile_type {
 	ED070EC1_NUM_PROFILES,
 	ED070EC1_PROFILE_INVALID = ED070EC1_NUM_PROFILES,
 };
+
+/* Delays */
+#define ED070_RESET_DELAY   3000
+#define MSG_SEND_DELAY      1000
+#define MYSTERY_SETUP_DELAY 10000
+#define ACTIVATION_DELAY    20000
+
+/* Pins */
+/** @brief Symbol specifying pin number for MOSI. */
+#define MOSI_PIN (9)
+/** @brief Symbol specifying pin number for MISO. */
+#define SCK_PIN  (8)
+#define DCX_PIN  (12)
+#define CS_PIN   (11)
+
+static K_SEM_DEFINE(transfer_finished, 0, 1);
 
 struct ed070ec1_quirks {
 	/* Gates */
@@ -66,6 +84,7 @@ struct ed070ec1_data {
 	uint8_t scan_mode;
 	bool blanking_on;
 	enum ed070ec1_profile_type profile;
+	nrfx_spim_t spim_inst;
 };
 
 struct ed070ec1_dt_array {
@@ -123,41 +142,28 @@ static inline void ed070ec1_busy_wait(const struct device *dev)
 static inline int ed070ec1_write_cmd(const struct device *dev, uint8_t cmd, const uint8_t *data,
 				     size_t len)
 {
-	const struct ed070ec1_config *config = dev->config;
-	struct spi_buf buf = {.buf = &cmd, .len = sizeof(cmd)};
-	struct spi_buf_set buf_set = {.buffers = &buf, .count = 1};
-	int err = 0;
+	const struct ed070ec1_data *dev_data = dev->data;
+	uint8_t size;
+	static uint8_t buf[10];
 
 	ed070ec1_busy_wait(dev);
 
-	err = gpio_pin_set_dt(&config->dc_gpio, 1);
-	if (err < 0) {
-		return err;
-	}
+	buf[0] = cmd;
+	size = sizeof(cmd);
 
-	err = spi_write_dt(&config->bus, &buf_set);
-	if (err < 0) {
-		goto spi_out;
-	}
-
-	if (data != NULL) {
-		buf.buf = (void *)data;
-		buf.len = len;
-
-		err = gpio_pin_set_dt(&config->dc_gpio, 0);
-		if (err < 0) {
-			goto spi_out;
-		}
-
-		err = spi_write_dt(&config->bus, &buf_set);
-		if (err < 0) {
-			goto spi_out;
+	nrfx_spim_xfer_desc_t spim_xfer_desc = NRFX_SPIM_XFER_TX(buf, size);
+	nrfx_spim_xfer_dcx(&dev_data->spim_inst, &spim_xfer_desc, 0, 1);
+	NRFX_DELAY_US(MSG_SEND_DELAY);
+	if ( len > 0 ) {
+		nrfx_spim_xfer_desc_t spim_xfer_desc1 = NRFX_SPIM_XFER_TX(data, len);
+		nrfx_spim_xfer_dcx(&dev_data->spim_inst, &spim_xfer_desc1, 0, 0);
+		if (k_sem_take(&transfer_finished, K_MSEC(100)) != 0) {
+			LOG_ERR("SPIM transfer timeout\n");
+			return -1;
 		}
 	}
 
-spi_out:
-	spi_release_dt(&config->bus);
-	return err;
+	return 0;
 }
 
 static inline int ed070ec1_write_uint8(const struct device *dev, uint8_t cmd, uint8_t data)
@@ -253,6 +259,7 @@ static inline int ed070ec1_set_ram_param(const struct device *dev, uint16_t sx, 
 	uint8_t tmp[4];
 	size_t len;
 
+	LOG_DBG("sx: %d ex: %d sy: %d ey: %d", sx, ex, sy, ey);
 	len = push_x_param(dev, tmp, sx);
 	len += push_x_param(dev, tmp + len, ex);
 	err = ed070ec1_write_cmd(dev, ED070EC1_CMD_RAM_XPOS_CTRL, tmp, len);
@@ -347,7 +354,6 @@ static int ed070ec1_set_window(const struct device *dev, const uint16_t x, const
 			       const struct display_buffer_descriptor *desc)
 {
 	const struct ed070ec1_config *config = dev->config;
-	const struct ed070ec1_data *data = dev->data;
 	int err;
 	uint16_t x_start;
 	uint16_t x_end;
@@ -384,30 +390,12 @@ static int ed070ec1_set_window(const struct device *dev, const uint16_t x, const
 		LOG_ERR("Y coordinate not multiple of %d", EPD_PANEL_NUMOF_ROWS_PER_PAGE);
 		return -EINVAL;
 	}
-
-	switch (data->scan_mode) {
-	case ED070EC1_DATA_ENTRY_XIYDY:
-		x_start = y / ED070EC1_PIXELS_PER_BYTE;
-		x_end = (y + desc->height - 1) / ED070EC1_PIXELS_PER_BYTE;
-		y_start = (x + desc->width - 1);
-		y_end = x;
-		break;
-
-	case ED070EC1_DATA_ENTRY_XDYIY:
-		x_start = (panel_h - 1 - y) / ED070EC1_PIXELS_PER_BYTE;
-		x_end = (panel_h - 1 - (y + desc->height - 1)) / ED070EC1_PIXELS_PER_BYTE;
-		y_start = x;
-		y_end = (x + desc->width - 1);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	err = ed070ec1_write_cmd(dev, ED070EC1_CMD_ENTRY_MODE, &data->scan_mode,
-				 sizeof(data->scan_mode));
-	if (err < 0) {
-		return err;
-	}
+	
+	/* TBD: Support set window */	
+	x_start = 0;
+	x_end = desc->width - 1;
+	y_start = y;
+	y_end = y + desc->height;
 
 	err = ed070ec1_set_ram_param(dev, x_start, x_end, y_start, y_end);
 	if (err < 0) {
@@ -611,12 +599,6 @@ static int ed070ec1_clear_cntlr_mem(const struct device *dev, uint8_t ram_cmd)
 	if (config->height % EPD_PANEL_NUMOF_ROWS_PER_PAGE) {
 		panel_h += 1;
 	}
-
-	err = ed070ec1_write_uint8(dev, ED070EC1_CMD_ENTRY_MODE, ED070EC1_DATA_ENTRY_XIYDY);
-	if (err < 0) {
-		return err;
-	}
-
 	err = ed070ec1_set_ram_param(dev, ED070EC1_PANEL_FIRST_PAGE, panel_h - 1, last_gate,
 				     ED070EC1_PANEL_FIRST_GATE);
 	if (err < 0) {
@@ -630,7 +612,7 @@ static int ed070ec1_clear_cntlr_mem(const struct device *dev, uint8_t ram_cmd)
 
 	memset(clear_page, 0xff, sizeof(clear_page));
 	for (int h = 0; h < panel_h; h++) {
-		size_t x = config->width;
+		size_t x = config->height;
 
 		while (x) {
 			size_t l = MIN(x, sizeof(clear_page));
@@ -707,7 +689,7 @@ static int ed070ec1_set_profile(const struct device *dev, enum ed070ec1_profile_
 	const struct ed070ec1_config *config = dev->config;
 	struct ed070ec1_data *data = dev->data;
 	const struct ed070ec1_profile *p;
-	const uint16_t last_gate = config->width - 1;
+	const uint16_t last_gate = config->height - 1;
 	uint8_t gdo[3];
 	size_t gdo_len;
 	int err = 0;
@@ -817,35 +799,21 @@ static int ed070ec1_controller_init(const struct device *dev)
 	struct ed070ec1_data *data = dev->data;
 	int err;
 
-	LOG_DBG("");
-
 	data->blanking_on = false;
 	data->profile = ED070EC1_PROFILE_INVALID;
 
-	err = gpio_pin_set_dt(&config->reset_gpio, 1);
-	if (err < 0) {
-		return err;
-	}
-
+	nrf_gpio_pin_clear(config->reset_gpio.pin);
 	k_msleep(ED070EC1_RESET_DELAY);
-	err = gpio_pin_set_dt(&config->reset_gpio, 0);
-	if (err < 0) {
-		return err;
-	}
-
+	nrf_gpio_pin_set(config->reset_gpio.pin);
 	k_msleep(ED070EC1_RESET_DELAY);
 
-	if (config->orientation == 1) {
-		data->scan_mode = ED070EC1_DATA_ENTRY_XIYDY;
-	} else {
-		data->scan_mode = ED070EC1_DATA_ENTRY_XDYIY;
-	}
+	data->scan_mode = ED070EC1_DATA_ENTRY_XIYDY;
 
 	err = ed070ec1_set_profile(dev, ED070EC1_PROFILE_FULL);
 	if (err < 0) {
 		return err;
 	}
-
+	#if 0
 	err = ed070ec1_clear_cntlr_mem(dev, ED070EC1_CMD_WRITE_RAM);
 	if (err < 0) {
 		return err;
@@ -855,7 +823,7 @@ static int ed070ec1_controller_init(const struct device *dev)
 	if (err < 0) {
 		return err;
 	}
-
+	#endif
 	err = ed070ec1_update_display(dev);
 	if (err < 0) {
 		return err;
@@ -864,47 +832,50 @@ static int ed070ec1_controller_init(const struct device *dev)
 	return 0;
 }
 
+
+/**
+ * @brief Function for handling SPIM driver events.
+ *
+ * @param[in] p_event   Pointer to the SPIM driver event.
+ * @param[in] p_context Pointer to the context passed from the driver.
+ */
+static void spim_handler(nrfx_spim_evt_t const *p_event, void *p_context)
+{
+	if (p_event->type == NRFX_SPIM_EVENT_DONE) {
+		k_sem_give(&transfer_finished);
+	}
+}
+
+#define MOSI_PIN (9)
+/** @brief Symbol specifying pin number for MISO. */
+#define SCK_PIN  (8)
+#define DCX_PIN  (12)
+#define CS_PIN   (11)
+
+#define SPIM_INST_IDX 4
+
 static int ed070ec1_init(const struct device *dev)
 {
 	const struct ed070ec1_config *config = dev->config;
 	struct ed070ec1_data *data = dev->data;
 	int err;
+	nrfx_err_t status;
+	(void)status;
 
-	LOG_DBG("");
+	nrf_gpio_cfg(config->reset_gpio.pin, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
 
-	if (!spi_is_ready_dt(&config->bus)) {
-		LOG_ERR("SPI bus %s not ready", config->bus.bus->name);
-		return -ENODEV;
-	}
-
-	data->read_supported = (config->bus.config.operation & SPI_HALF_DUPLEX) != 0;
-
-	if (!gpio_is_ready_dt(&config->reset_gpio)) {
-		LOG_ERR("Reset GPIO device not ready");
-		return -ENODEV;
-	}
-
-	err = gpio_pin_configure_dt(&config->reset_gpio, GPIO_OUTPUT_INACTIVE);
-	if (err < 0) {
-		LOG_ERR("Failed to configure reset GPIO");
-		return err;
-	}
-
-	if (!gpio_is_ready_dt(&config->dc_gpio)) {
-		LOG_ERR("DC GPIO device not ready");
-		return -ENODEV;
-	}
-
-	err = gpio_pin_configure_dt(&config->dc_gpio, GPIO_OUTPUT_INACTIVE);
-	if (err < 0) {
-		LOG_ERR("Failed to configure DC GPIO");
-		return err;
-	}
-
-	if (!gpio_is_ready_dt(&config->busy_gpio)) {
-		LOG_ERR("Busy GPIO device not ready");
-		return -ENODEV;
-	}
+	nrfx_spim_t spim_inst = NRFX_SPIM_INSTANCE(SPIM_INST_IDX);
+	data->spim_inst = spim_inst;
+	nrfx_spim_config_t spim_config =
+		NRFX_SPIM_DEFAULT_CONFIG(SCK_PIN, MOSI_PIN, MOSI_PIN, CS_PIN);
+	spim_config.dcx_pin = DCX_PIN;
+	spim_config.frequency = 8000000;
+	spim_config.mode = NRF_SPIM_MODE_0;
+	spim_config.use_hw_ss = true;
+	char p_context[20] = "initial";
+	NRFX_DELAY_US(50000);
+	status = nrfx_spim_init(&data->spim_inst, &spim_config, spim_handler, (void *)p_context);
 
 	err = gpio_pin_configure_dt(&config->busy_gpio, GPIO_INPUT);
 	if (err < 0) {
@@ -938,7 +909,7 @@ static struct display_driver_api ed070ec1_driver_api = {
 static struct ed070ec1_quirks quirks_solomon_ed070ec1 = {
 	.max_width = 960,
 	.max_height = 640,
-	.pp_width_bits = 8,
+	.pp_width_bits = 16,
 	.pp_height_bits = 16,
 	.ctrl2_full = ED070EC1_GEN2_CTRL2_DISPLAY,
 	.ctrl2_partial = ED070EC1_GEN2_CTRL2_DISPLAY | ED070EC1_GEN2_CTRL2_MODE2,
@@ -1013,9 +984,4 @@ static struct ed070ec1_quirks quirks_solomon_ed070ec1 = {
 	DEVICE_DT_DEFINE(n, ed070ec1_init, NULL, &ed070ec1_data_##n, &ed070ec1_cfg_##n,            \
 			 POST_KERNEL, CONFIG_DISPLAY_INIT_PRIORITY, &ed070ec1_driver_api)
 
-DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1608, ED070EC1_DEFINE, &quirks_solomon_ssd1608);
-DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1673, ED070EC1_DEFINE, &quirks_solomon_ssd1673);
-DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1675a, ED070EC1_DEFINE, &quirks_solomon_ssd1675a);
-DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1680, ED070EC1_DEFINE, &quirks_solomon_ssd1680);
-DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1681, ED070EC1_DEFINE, &quirks_solomon_ssd1681);
 DT_FOREACH_STATUS_OKAY_VARGS(solomon_ed070ec1, ED070EC1_DEFINE, &quirks_solomon_ed070ec1);
