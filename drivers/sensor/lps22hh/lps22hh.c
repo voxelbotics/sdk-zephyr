@@ -148,6 +148,8 @@ static int lps22hh_set_int_s(stmdev_ctx_t *ctx, uint8_t int_s)
 		ctrl_reg3.int_s = int_s;
 		ret = lps22hh_write_reg(ctx, LPS22HH_CTRL_REG3, (uint8_t *)&ctrl_reg3, 1);
 	}
+
+	return ret;
 }
 
 static int lps22hh_threshold_set(const struct device *dev, uint16_t threshold)
@@ -155,7 +157,6 @@ static int lps22hh_threshold_set(const struct device *dev, uint16_t threshold)
 	const struct lps22hh_config *const cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
 
-	lps22hh_autozero_set(ctx, 1);
 	lps22hh_int_on_threshold_set(ctx, LPS22HH_POSITIVE);
 	lps22hh_set_int_s(ctx, LPS22HH_POSITIVE);
 	lps22hh_int_treshold_set(ctx, threshold);
